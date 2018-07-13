@@ -28,8 +28,15 @@ from urllib3.connectionpool import HTTPSConnectionPool, HTTPConnectionPool
 class MatchError(Exception):
     pass
 
-Request = namedtuple('Request', ['method', 'url', 'body', 'headers',
-                                     'scheme', 'host', 'port'])
+class Request(namedtuple('Request', ['method', 'raw_url', 'body', 'headers', 'scheme', 'host', 'port'])):
+
+    @property
+    def built_url(self):
+        return "{0}://{1}{2}".format(self.scheme, self.host, self.raw_url)
+
+    @property
+    def url(self):
+        return "{0}://{1}:{2}{3}".format(self.scheme, self.host, self.port, self.raw_url)
 
 try:
     from requests.packages.urllib3.response import HTTPResponse
@@ -224,7 +231,9 @@ def _get_content_headers(headers):
     _, params = cgi.parse_header(clean_headers.get('content-type'))
     content_type = params.get('charset')
     content_encoding = headers.get('content-encoding', "")
-    content_encodings = [e.strip() for e in content_encoding.split(',')]
+    content_encodings = []
+    if content_encoding:
+        content_encodings = [e.strip() for e in content_encoding.split(',')]
     return content_type, content_encodings
 
 class BaseResponse(object):
@@ -420,6 +429,7 @@ class RequestsMock(object):
                  assert_all_requests_are_fired=True,
                  response_callback=None,
                  allow_external_requests=False,
+                 debug_mode=False,
                  passthru_prefixes=(),
                  target=TARGET):
         self._calls = CallList()
@@ -429,11 +439,13 @@ class RequestsMock(object):
         self.passthru_prefixes = tuple(passthru_prefixes)
         self.target = target
         self.allow_external_requests = allow_external_requests
+        self.debug_mode = debug_mode
         self.patchers = []
 
     def reset(self):
         self._matches = []
         self.patchers = []
+        self.debug_mode = False
         self._calls.reset()
 
     def add(
@@ -514,6 +526,12 @@ class RequestsMock(object):
 
         """
         self.allow_external_requests = False
+
+    def enable_debug_mode(self):
+        self.debug_mode = True
+
+    def disable_debug_mode(self):
+        self.debug_mode = False
 
     def remove(self, method_or_response=None, url=None):
         """
@@ -622,11 +640,15 @@ class RequestsMock(object):
                         'url': request.url,
                     })
                 return _real_send(adapter, request)
-            try:
-                real_response = _real_send(adapter, request)
-                response = self._on_no_match(request, resp_callback, actual_response=real_response.content)
-            except ConnectionError:
-                response = self._on_no_match(request, resp_callback, actual_response='ConnectionError: actual response could not be returned')
+
+            response = self._on_no_match(request, resp_callback)
+
+            if self.debug_mode:
+                try:
+                    real_response = _real_send(adapter, request)
+                    response = self._on_no_match(request, resp_callback, actual_response=real_response.content)
+                except ConnectionError:
+                    response = self._on_no_match(request, resp_callback, actual_response='ConnectionError: actual response could not be returned')
             raise response
 
         try:
@@ -656,8 +678,7 @@ class RequestsMock(object):
 
     def _on_urlopen(self, pool, method, url, body=None, headers=None, **kwargs):
         built_url = "{0}://{1}{2}".format(pool.scheme, pool.host, url)
-
-        request = Request(method, built_url, body, headers, pool.scheme,
+        request = Request(method, url, body, headers, pool.scheme,
                 pool.host, pool.port)
 
         match = self._find_match(request)
@@ -677,21 +698,25 @@ class RequestsMock(object):
                         'url': request.url,
                     })
                 return scheme_to_urlopen[pool.scheme](pool, method, built_url, body=body, headers=headers, **kwargs)
-            try:
-                real_response = scheme_to_urlopen[pool.scheme](pool, method, built_url, body=body, headers=headers, **kwargs)
-                charset, content_encodings = _get_content_headers(real_response.headers)
-                body = _handle_body(real_response.read())
-                uncompressed_body = _uncompress_body(body, content_encodings)
 
-                if isinstance(uncompressed_body, BufferIO):
-                    uncompressed_body = uncompressed_body.read()
+            response = self._on_no_match(request, resp_callback)
 
-                if charset:
-                    uncompressed_body = uncompressed_body.decode(charset)
+            if self.debug_mode:
+                try:
+                    real_response = scheme_to_urlopen[pool.scheme](pool, method, built_url, body=body, headers=headers, **kwargs)
+                    charset, content_encodings = _get_content_headers(real_response.headers)
+                    body = _handle_body(real_response.read())
+                    uncompressed_body = _uncompress_body(body, content_encodings)
 
-                response = self._on_no_match(request, resp_callback, actual_response=uncompressed_body)
-            except urllib3.exceptions.ConnectionError:
-                response = self._on_no_match(request, resp_callback, actual_response='ConnectionError: actual response could not be returned')
+                    if isinstance(uncompressed_body, BufferIO):
+                        uncompressed_body = uncompressed_body.read()
+
+                    if charset:
+                        uncompressed_body = uncompressed_body.decode(charset)
+
+                    response = self._on_no_match(request, resp_callback, actual_response=uncompressed_body)
+                except urllib3.exceptions.ConnectionError:
+                    response = self._on_no_match(request, resp_callback, actual_response='ConnectionError: actual response could not be returned')
             raise response
 
         try:
@@ -716,8 +741,11 @@ class RequestsMock(object):
         return response
 
     def _on_no_match(self, request, resp_callback, actual_response=None):
-        error_msg = 'Cannot match any mock for the following request: {0} {1}, with response: {2}'.format(
-        request.method, request.url, actual_response)
+        error_msg = 'Cannot match any mock for the following request: {0} {1}'.format(
+                request.method, request.url, actual_response)
+        if actual_response:
+            error_msg = 'Cannot match any mock for the following request: {0} {1}, with response: {2}'.format(
+                request.method, request.url, actual_response)
         response = MatchError(error_msg)
         response.request = request
 
@@ -753,21 +781,24 @@ class RequestsMock(object):
                         'url': request.url,
                     })
                 return _real_urllib2_urlopen(url)
-            try:
-                real_response = _real_urllib2_urlopen(url)
-                charset, content_encodings = _get_content_headers(dict(real_response.headers))
-                body = _handle_body(real_response.read())
-                uncompressed_body = _uncompress_body(body, content_encodings)
-                if isinstance(uncompressed_body, BufferIO):
-                    uncompressed_body = uncompressed_body.read()
 
-                if charset:
-                    uncompressed_body = uncompressed_body.decode(charset)
+            response = self._on_no_match(request, resp_callback)
 
+            if self.debug_mode:
+                try:
+                    real_response = _real_urllib2_urlopen(url)
+                    charset, content_encodings = _get_content_headers(dict(real_response.headers))
+                    body = _handle_body(real_response.read())
+                    uncompressed_body = _uncompress_body(body, content_encodings)
+                    if isinstance(uncompressed_body, BufferIO):
+                        uncompressed_body = uncompressed_body.read()
 
-                response = self._on_no_match(request, resp_callback, actual_response=uncompressed_body)
-            except urllib2.URLError:
-                response = self._on_no_match(request, resp_callback, actual_response='ConnectionError: actual response could not be returned')
+                    if charset:
+                        uncompressed_body = uncompressed_body.decode(charset)
+
+                    response = self._on_no_match(request, resp_callback, actual_response=uncompressed_body)
+                except urllib2.URLError:
+                    response = self._on_no_match(request, resp_callback, actual_response='ConnectionError: actual response could not be returned')
             raise response
 
         class MockHTTPSConnection(HTTPSConnection):

@@ -7,7 +7,7 @@ import re
 import requests
 import responses
 import pytest
-from responses import BaseResponse, Response
+from responses import BaseResponse, Response, MatchError
 
 from inspect import getargspec
 from requests.exceptions import ConnectionError, HTTPError
@@ -134,15 +134,16 @@ def test_remove():
         responses.remove(responses.GET,
                          re.compile(r'http://example\.com/four'))
 
-        with pytest.raises(ConnectionError):
+        with pytest.raises(MatchError):
             requests.get('http://example.com/zero')
         requests.get('http://example.com/one')
-        with pytest.raises(ConnectionError):
+        with pytest.raises(MatchError):
             requests.get('http://example.com/two')
         requests.get('http://example.com/three')
-        with pytest.raises(ConnectionError):
+        with pytest.raises(MatchError):
             requests.get('http://example.com/four')
 
+    print('hello')
     run()
     assert_reset()
 
@@ -426,7 +427,7 @@ def test_regular_expression_url():
         resp = requests.get('https://uk.example.com')
         assert_response(resp, 'test')
 
-        with pytest.raises(ConnectionError):
+        with pytest.raises(MatchError):
             requests.get('https://uk.exaaample.com')
 
     run()
@@ -750,6 +751,7 @@ def test_passthru(httpserver):
 
     @responses.activate
     def run():
+        print(httpserver.url)
         responses.add_passthru(httpserver.url)
         responses.add(
             responses.GET, '{}/one'.format(httpserver.url), body='one')
@@ -799,3 +801,4 @@ def test_custom_target(monkeypatch):
     requests_mock.start()
     assert len(patch_mock.call_args_list) == 1
     assert patch_mock.call_args[1]['target'] == 'something.else'
+
